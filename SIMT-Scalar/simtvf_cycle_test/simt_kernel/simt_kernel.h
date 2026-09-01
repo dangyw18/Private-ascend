@@ -26,7 +26,9 @@ __simt_vf__ __launch_bounds__(SIMT_THREADS) inline void SimtKernel(
 
     // First observable point inside SIMTVF.  Only thread 0 records it.
     if (tid == 0) {
-        cycles[0] = get_sys_cnt() - outer_t0;
+        // SIMT VF has a separate execution namespace.  Qualify the CCEC
+        // scalar builtin explicitly instead of relying on unqualified lookup.
+        cycles[0] = __cce_scalar::get_sys_cnt() - outer_t0;
     }
 
     // Keep the workload strictly after the entry timestamp.
