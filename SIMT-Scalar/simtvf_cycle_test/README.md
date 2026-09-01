@@ -1,6 +1,7 @@
 # SIMTVF 冷启动 cycle 测试
 
-本例沿用 `cycle_count_demo` 的 `get_sys_cnt()` 和 `PIPE_V -> PIPE_S` 同步方式，只测一个问题：
+本例沿用 `cycle_count_demo` 的系统 cycle 计数和 `PIPE_V -> PIPE_S` 同步思路，并通过
+AscendC 公开的 `clock()` 接口在 SIMD 与 SIMT 两侧取时间戳，只测一个问题：
 **当前 Vector kernel 中第一次 SIMTVF 调用，到 SIMT thread 0 执行入口时间戳的 cycle 数。**
 
 ## 文件结构
@@ -22,14 +23,14 @@ simtvf_cycle_test/
 ```text
 __vector__ kernel                        __simt_vf__
 
-t0 = get_sys_cnt_safe()
+t0 = clock_safe()                    // SIMD/Vector 侧
         |
         +--- asc_vf_call --------------> thread 0:
-                                          entry = get_sys_cnt()
+                                          entry = clock()  // SIMT 侧
                                           cycles[0] = entry - t0
                                           workload
         <--- PIPE_V -> PIPE_S wait ------+
-t1 = get_sys_cnt_safe()
+t1 = clock_safe()                    // SIMD/Vector 侧
 cycles[1] = t1 - t0
 ```
 
@@ -87,7 +88,14 @@ SIMT_THREADS=64 ./run.sh --build-only
 
 这里的“冷启动”指 **单个 Vector kernel 中第一次 SIMTVF 调用**，不是设备上电或休眠唤醒。
 
-## 编译前提
+## 计时接口合法性
 
-本方法需要 CCEC 支持在 `__simt_vf__` 中调用 `get_sys_cnt()`。如果编译器明确拒绝这个调用，
-则不能用入口时间戳拆出冷启动；只能测外层总区间，而外层总区间包含计算和退出。
+不要在 `__simt_vf__` 中调用 scalar 内建函数 `get_sys_cnt()`，即使显式写成
+`__cce_scalar::get_sys_cnt()`，也会在 CCEC 的 SIMT 后端阶段失败。
+
+本例统一使用公开头文件 `utils/debug/asc_time.h`：
+
+- Vector 侧 `__asc_aicore::clock()` 的实现读取 `get_sys_cnt()`；
+- SIMT 侧 `__asc_simt_vf::clock()` 的实现读取 SIMT `CLOCK64`；
+- 官方将两者都定义为从程序开始累计的 Cycle Count，因此可作时间戳差；
+- SIMT `clock()` 仅在 Ascend 950PR/950DT 上受支持。

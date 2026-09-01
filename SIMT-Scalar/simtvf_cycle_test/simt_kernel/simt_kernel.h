@@ -10,6 +10,7 @@
 
 #include "simt_api/common_functions.h"
 #include "simt_api/device_functions.h"
+#include "utils/debug/asc_time.h"
 
 #ifndef SIMT_THREADS
 #define SIMT_THREADS 32
@@ -20,15 +21,15 @@ static_assert(SIMT_THREADS > 0 && SIMT_THREADS <= 2048,
 
 __simt_vf__ __launch_bounds__(SIMT_THREADS) inline void SimtKernel(
     __gm__ uint32_t* input, __gm__ uint32_t* output,
-    __gm__ int64_t* cycles, int64_t outer_t0, uint32_t workload_iters)
+    __gm__ uint64_t* cycles, uint64_t outer_t0, uint32_t workload_iters)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
 
     // First observable point inside SIMTVF.  Only thread 0 records it.
     if (tid == 0) {
-        // SIMT VF has a separate execution namespace.  Qualify the CCEC
-        // scalar builtin explicitly instead of relying on unqualified lookup.
-        cycles[0] = __cce_scalar::get_sys_cnt() - outer_t0;
+        // clock() is the public SIMT timestamp API.  Do not call the scalar
+        // get_sys_cnt() builtin here: it is not legal in a SIMT VF function.
+        cycles[0] = __asc_simt_vf::clock() - outer_t0;
     }
 
     // Keep the workload strictly after the entry timestamp.
