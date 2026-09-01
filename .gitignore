@@ -4,3 +4,4 @@
 *.log
 **/reduce_demo/input/
 **/reduce_demo/output/
+**/results/
