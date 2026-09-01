@@ -44,6 +44,15 @@ cycles[1] = t1 - t0
 如果只照抄 `cycle_count_demo` 的外层 `t1-t0`，得到的是完整 SIMTVF 区间，不能单独称为冷启动。
 因此本例只比它多一个 SIMT 入口时间戳。
 
+两种读法不要混用：
+
+- 要完全复刻 `cycle_count_demo` 的计时方式，只分析 `total_cycles`；它只由外层两次
+  `get_sys_cnt()` 相减得到，不依赖 SIMT 内部的 `clock()`。
+- 要分析“从发起调用到 thread 0 进入 SIMT”的区间，分析 `cold_entry_cycles`；
+  该区间必须取得 SIMT 内部入口时间戳，所以需要 `clock()`。
+- `total_cycles - cold_entry_cycles` 是进入 SIMT 后到外层同步完成的剩余区间，
+  包含 workload、退出和同步，不能直接称为单独的销毁开销。
+
 ## 第一步：只跑一个最小用例
 
 默认配置是 32 threads、0 次循环计算、重复 30 次：
