@@ -1,7 +1,7 @@
 # SIMTVF 冷启动 cycle 测试
 
-本例沿用 `cycle_count_demo` 的系统 cycle 计数和 `PIPE_V -> PIPE_S` 同步思路，并通过
-AscendC 公开的 `clock()` 接口在 SIMD 与 SIMT 两侧取时间戳，只测一个问题：
+本例沿用 `cycle_count_demo` 的系统 cycle 计数和 `PIPE_V -> PIPE_S` 同步思路：
+Vector 侧用 `get_sys_cnt()`，SIMT 侧用公开的 `clock()` 接口，只测一个问题：
 **当前 Vector kernel 中第一次 SIMTVF 调用，到 SIMT thread 0 执行入口时间戳的 cycle 数。**
 
 ## 文件结构
@@ -23,14 +23,14 @@ simtvf_cycle_test/
 ```text
 __vector__ kernel                        __simt_vf__
 
-t0 = clock_safe()                    // SIMD/Vector 侧
+t0 = get_sys_cnt_safe()              // SIMD/Vector 侧
         |
         +--- asc_vf_call --------------> thread 0:
                                           entry = clock()  // SIMT 侧
                                           cycles[0] = entry - t0
                                           workload
         <--- PIPE_V -> PIPE_S wait ------+
-t1 = clock_safe()                    // SIMD/Vector 侧
+t1 = get_sys_cnt_safe()              // SIMD/Vector 侧
 cycles[1] = t1 - t0
 ```
 
@@ -93,9 +93,13 @@ SIMT_THREADS=64 ./run.sh --build-only
 不要在 `__simt_vf__` 中调用 scalar 内建函数 `get_sys_cnt()`，即使显式写成
 `__cce_scalar::get_sys_cnt()`，也会在 CCEC 的 SIMT 后端阶段失败。
 
-本例统一使用公开头文件 `utils/debug/asc_time.h`：
+本例兼容服务器使用的 CANN 9.1.0-beta.3：
 
-- Vector 侧 `__asc_aicore::clock()` 的实现读取 `get_sys_cnt()`；
+- Vector 侧用原有的 `get_sys_cnt()`；
 - SIMT 侧 `__asc_simt_vf::clock()` 的实现读取 SIMT `CLOCK64`；
 - 官方将两者都定义为从程序开始累计的 Cycle Count，因此可作时间戳差；
 - SIMT `clock()` 仅在 Ascend 950PR/950DT 上受支持。
+
+CANN 9.1.0-beta.3 尚未提供 `__asc_aicore::clock()`；该接口在正式版中才加入，
+且其实现本身就是把 `get_sys_cnt()` 转为 `uint64_t`，因此这里直接使用
+`get_sys_cnt()` 与正式版语义一致。
