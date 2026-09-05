@@ -1,124 +1,91 @@
-"""Stage-1 Ascend SimtVF rewrite of MHC post forward."""
+"""MHC post forward — Ascend port of tile_kernels/mhc/post_kernel.py.
+
+The kernel body is kept verbatim from the GPU original (same buffer and loop
+names). The only Ascend changes:
+
+- ``threads=n_thr`` moves from ``T.Kernel`` into ``T.SimtVF``.
+- ``T.pdl_sync`` / ``disable_tma`` / ``T.Pipelined`` are CUDA-only; the hidden
+  tiling uses ``T.serial`` and the per-tile compute region is wrapped in
+  ``T.SimtVF``.
+- ``a`` / ``c`` are staged through shared (UB) buffers instead of direct
+  GM -> fragment loads.
+- The host wrapper compiles with ``target="ascend"``.
+"""
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
+from functools import lru_cache
 
 import tilelang
-import tilelang.language as T
 import torch
+from tilelang import language as T
 
-
-THREADS = 128
-HIDDEN_BLOCK_SIZE = 256
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
 
-def post_fwd_program(
-    num_tokens: int,
-    mhc_mult: int,
-    hidden_size: int,
-    hidden_block_size: int = HIDDEN_BLOCK_SIZE,
-    threads: int = THREADS,
-):
-    """Build the MTE/serial-tile/SimtVF form used by the Ascend example."""
-    assert num_tokens > 0
-    assert mhc_mult > 0
-    assert hidden_size > 0
-    assert hidden_block_size > 0
-    assert threads > 0
-    hidden_block_size = math.gcd(hidden_size, hidden_block_size)
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) -> tilelang.JITKernel:
+    n = T.dynamic('num_tokens')
+    h = hidden
+
+    h_blk = math.gcd(hidden, h_blk)
 
     @T.prim_func
-    def main(
-        comb_res_mix: T.Buffer((num_tokens, mhc_mult, mhc_mult), "float32"),
-        residual: T.Buffer(
-            (num_tokens, mhc_mult, hidden_size), "bfloat16"
-        ),
-        post_layer_mix: T.Buffer((num_tokens, mhc_mult), "float32"),
-        x: T.Buffer((num_tokens, hidden_size), "bfloat16"),
-        output: T.Buffer(
-            (num_tokens, mhc_mult, hidden_size), "bfloat16"
-        ),
-    ):
-        with T.Kernel(num_tokens) as token:
-            output_ub = T.alloc_shared(
-                (mhc_mult, hidden_block_size), T.bfloat16
-            )
-            residual_ub = T.alloc_shared(
-                (mhc_mult, hidden_block_size), T.bfloat16
-            )
-            x_ub = T.alloc_shared((hidden_block_size,), T.bfloat16)
-            comb_ub = T.alloc_shared((mhc_mult, mhc_mult), T.float32)
-            post_mix_ub = T.alloc_shared((mhc_mult,), T.float32)
+    def _mhc_post_fwd_kernel(
+        a: T.Tensor[(n, mhc, mhc), T.float32],
+        b: T.Tensor[(n, mhc, h), T.bfloat16],
+        c: T.Tensor[(n, mhc), T.float32],
+        d: T.Tensor[(n, h), T.bfloat16],
+        x: T.Tensor[(n, mhc, h), T.bfloat16],
+    ) -> None:
+        with T.Kernel(n) as pid_n:
+            x_shared = T.alloc_shared((mhc, h_blk), T.bfloat16)
+            b_shared = T.alloc_shared((mhc, h_blk), T.bfloat16)
+            d_shared = T.alloc_shared(h_blk, T.bfloat16)
 
-            T.copy(comb_res_mix[token, 0, 0], comb_ub)
-            T.copy(post_layer_mix[token, 0], post_mix_ub)
+            # Ascend: stage a / c through UB instead of GM -> fragment loads.
+            a_shared = T.alloc_shared((mhc, mhc), T.float32)
+            c_shared = T.alloc_shared(mhc, T.float32)
+            T.copy(a[pid_n, 0, 0], a_shared)
+            T.copy(c[pid_n, 0], c_shared)
 
-            # Preserve the serial hidden tiling and all GM<->UB copies.
-            for hidden_tile in T.serial(hidden_size // hidden_block_size):
-                hidden_offset = hidden_tile * hidden_block_size
-                T.copy(
-                    residual[token, 0, hidden_offset], residual_ub
-                )
-                T.copy(x[token, hidden_offset], x_ub)
+            # Ascend: T.Pipelined is CUDA-only; serial hidden tiling instead.
+            for i0_h in T.serial(T.ceildiv(h, h_blk)):
+                T.copy(b[pid_n, 0, i0_h * h_blk], b_shared)
+                T.copy(d[pid_n, i0_h * h_blk], d_shared)
 
-                with T.SimtVF(threads=threads):
-                    output_frag = T.alloc_fragment(
-                        (mhc_mult, hidden_block_size), T.float32
-                    )
-                    residual_frag = T.alloc_fragment(
-                        (mhc_mult, hidden_block_size), T.float32
-                    )
-                    x_frag = T.alloc_fragment(
-                        (hidden_block_size,), T.float32
-                    )
+                with T.SimtVF(threads=n_thr):
+                    x_local = T.alloc_fragment((mhc, h_blk), T.float32)
+                    b_local = T.alloc_fragment((mhc, h_blk), T.float32)
+                    d_local = T.alloc_fragment(h_blk, T.float32)
 
-                    # These dtype-changing UB<->fragment copies are normal
-                    # thread copies and therefore remain inside SimtVF.
-                    T.copy(residual_ub, residual_frag)
-                    T.copy(x_ub, x_frag)
-                    for output_mix, hidden_idx in T.Parallel(
-                        mhc_mult, hidden_block_size
-                    ):
-                        output_frag[output_mix, hidden_idx] = (
-                            post_mix_ub[output_mix] * x_frag[hidden_idx]
-                        )
-                        for input_mix in T.serial(mhc_mult):
-                            output_frag[output_mix, hidden_idx] += (
-                                comb_ub[input_mix, output_mix]
-                                * residual_frag[input_mix, hidden_idx]
-                            )
-                    T.copy(output_frag, output_ub)
+                    a_local = T.alloc_fragment((mhc, mhc), T.float32)
+                    c_local = T.alloc_fragment(mhc, T.float32)
+                    for i_mhci, i_mhco in T.Parallel(mhc, mhc):
+                        a_local[i_mhci, i_mhco] = a_shared[i_mhci, i_mhco]
+                    for i_mhc in T.Parallel(mhc):
+                        c_local[i_mhc] = c_shared[i_mhc]
 
-                T.copy(output_ub, output[token, 0, hidden_offset])
+                    T.copy(b_shared, b_local)
+                    T.copy(d_shared, d_local)
+                    for i_mhco, i1_h in T.Parallel(mhc, h_blk):
+                        x_local[i_mhco, i1_h] = c_local[i_mhco] * d_local[i1_h]
+                        for i_mhci in T.serial(mhc):
+                            x_local[i_mhco, i1_h] += a_local[i_mhci, i_mhco] * b_local[i_mhci, i1_h]
+                    T.copy(x_local, x_shared)
 
-    return main
+                T.copy(x_shared, x[pid_n, 0, i0_h * h_blk])
+
+    return _mhc_post_fwd_kernel
 
 
 @lru_cache(maxsize=None)
-def _compile_post_fwd(
-    num_tokens: int,
-    mhc_mult: int,
-    hidden_size: int,
-    hidden_block_size: int,
-    threads: int,
-):
-    return tilelang.compile(
-        post_fwd_program(
-            num_tokens,
-            mhc_mult,
-            hidden_size,
-            hidden_block_size,
-            threads,
-        ),
-        target="ascend",
-        out_idx=-1,
-        pass_configs=_PASS_CONFIGS,
-    )
+def _compile_mhc_post_fwd(mhc: int, hidden: int, n_thr: int, h_blk: int):
+    prim = _mhc_post_fwd.get_tir(mhc, hidden, n_thr, h_blk)
+    return tilelang.compile(prim, target="ascend", pass_configs=_PASS_CONFIGS)
 
 
 def mhc_post_fwd(
@@ -126,49 +93,37 @@ def mhc_post_fwd(
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
-    hidden_block_size: int = HIDDEN_BLOCK_SIZE,
-    threads: int = THREADS,
+    out: torch.Tensor | None = None,
+    n_thr: int = 128,
+    h_blk: int = 1024,
 ) -> torch.Tensor:
-    """Compile and invoke MHC post using the original public tensor shapes."""
-    assert residual.dtype == torch.bfloat16
-    assert residual.ndim == 4
-    num_sequences, num_tokens, mhc_mult, hidden_size = residual.shape
-    assert x.shape == (num_sequences, num_tokens, hidden_size)
-    assert x.dtype == torch.bfloat16
-    assert post_layer_mix.shape == (
-        num_sequences,
-        num_tokens,
-        mhc_mult,
-        1,
-    )
-    assert post_layer_mix.dtype == torch.float32
-    assert comb_res_mix.shape == (
-        num_sequences,
-        num_tokens,
-        mhc_mult,
-        mhc_mult,
-    )
-    assert comb_res_mix.dtype == torch.float32
+    """Host wrapper mirroring tile_kernels/mhc/post_kernel.py."""
+    num_seqs, num_tokens, mhc, hidden = residual.shape
+
+    assert x.dtype == torch.bfloat16, f'{x.dtype=}'
+    assert residual.dtype == torch.bfloat16, f'{residual.dtype=}'
+    assert post_layer_mix.dtype == torch.float32, f'{post_layer_mix.dtype=}'
+    assert comb_res_mix.dtype == torch.float32, f'{comb_res_mix.dtype=}'
+    assert x.shape == (num_seqs, num_tokens, hidden), f'{x.shape=}'
+    assert post_layer_mix.shape == (num_seqs, num_tokens, mhc, 1), f'{post_layer_mix.shape=}'
+    assert comb_res_mix.shape == (num_seqs, num_tokens, mhc, mhc), f'{comb_res_mix.shape=}'
+
+    residual = residual.contiguous()
     assert x.is_contiguous()
-    assert residual.is_contiguous()
     assert post_layer_mix.is_contiguous()
     assert comb_res_mix.is_contiguous()
 
-    flat_tokens = num_sequences * num_tokens
-    kernel = _compile_post_fwd(
-        flat_tokens,
-        mhc_mult,
-        hidden_size,
-        hidden_block_size,
-        threads,
+    if out is None:
+        out = torch.empty_like(residual)
+    kernel = _compile_mhc_post_fwd(mhc, hidden, n_thr, h_blk)
+    kernel(
+        comb_res_mix.flatten(0, 1),
+        residual.flatten(0, 1),
+        post_layer_mix.flatten(0, 1).squeeze(-1),
+        x.flatten(0, 1),
+        out.flatten(0, 1),
     )
-    output = kernel(
-        comb_res_mix.reshape(flat_tokens, mhc_mult, mhc_mult),
-        residual.reshape(flat_tokens, mhc_mult, hidden_size),
-        post_layer_mix.reshape(flat_tokens, mhc_mult),
-        x.reshape(flat_tokens, hidden_size),
-    )
-    return output.reshape_as(residual)
+    return out
 
 
 def mhc_post_fwd_ref(
