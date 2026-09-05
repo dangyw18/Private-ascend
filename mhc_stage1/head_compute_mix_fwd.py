@@ -1,83 +1,63 @@
-"""Stage-1 Ascend SimtVF rewrite of MHC head-compute-mix forward."""
+"""MHC head-compute-mix forward — Ascend port of tile_kernels/mhc/head_compute_mix_kernel.py.
+
+The kernel body is kept verbatim from the GPU original (same buffer and loop
+names). The only Ascend change (pattern from examples/ascend/test_mhc_copy.py):
+
+- The single ``T.Parallel`` nest is wrapped in ``T.SimtVF`` (light workload,
+  direct GM access, no UB staging needed).
+- The host wrapper compiles with ``target="ascend"``.
+"""
 
 from __future__ import annotations
 
 from functools import lru_cache
 
 import tilelang
-import tilelang.language as T
 import torch
+from tilelang import language as T
 
-
-THREADS = 128
-TOKEN_BLOCK_SIZE = 32
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
 
-def head_compute_mix_fwd_program(
-    num_tokens: int,
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def _mhc_head_compute_mix_fwd(
     mhc_mult: int,
     mhc_pre_eps: float,
-    token_block_size: int = TOKEN_BLOCK_SIZE,
-    threads: int = THREADS,
-):
-    """Build the explicitly scoped Ascend program.
-
-    This is the Stage-1 direct-global case: the only ``T.Parallel`` nest and
-    its scalar expression are enclosed by one SimtVF.
-    """
-    assert num_tokens > 0
-    assert mhc_mult > 0
-    assert token_block_size > 0
-    assert threads > 0
+    token_block_size: int,
+    threads: int = 128,
+) -> tilelang.JITKernel:
+    num_tokens = T.dynamic('num_tokens')
 
     @T.prim_func
-    def main(
-        input_mix: T.Buffer((num_tokens, mhc_mult), "float32"),
-        mhc_scale: T.Buffer((1,), "float32"),
-        mhc_base: T.Buffer((mhc_mult,), "float32"),
-        output_mix: T.Buffer((num_tokens, mhc_mult), "float32"),
-    ):
+    def mhc_head_compute_mix_fwd_kernel(
+        # Input
+        input_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+        mhc_scale: T.Tensor[(1,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult,), T.float32],
+        # Output
+        output_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+    ) -> None:
         with T.Kernel(T.ceildiv(num_tokens, token_block_size)) as pid:
             with T.SimtVF(threads=threads):
-                for local_token, mix_idx in T.Parallel(
-                    token_block_size, mhc_mult
-                ):
-                    token = pid * token_block_size + local_token
-                    if token < num_tokens:
-                        output_mix[token, mix_idx] = (
-                            T.sigmoid(
-                                input_mix[token, mix_idx] * mhc_scale[0]
-                                + mhc_base[mix_idx]
-                            )
-                            + mhc_pre_eps
-                        )
+                for i1, j in T.Parallel(token_block_size, mhc_mult):
+                    i = pid * token_block_size + i1
+                    if i < num_tokens:
+                        output_mix[i, j] = T.sigmoid(input_mix[i, j] * mhc_scale[0] + mhc_base[j]) + mhc_pre_eps
 
-    return main
+    return mhc_head_compute_mix_fwd_kernel
 
 
 @lru_cache(maxsize=None)
-def _compile_head_compute_mix_fwd(
-    num_tokens: int,
+def _compile_mhc_head_compute_mix_fwd(
     mhc_mult: int,
     mhc_pre_eps: float,
     token_block_size: int,
     threads: int,
 ):
-    return tilelang.compile(
-        head_compute_mix_fwd_program(
-            num_tokens,
-            mhc_mult,
-            mhc_pre_eps,
-            token_block_size,
-            threads,
-        ),
-        target="ascend",
-        out_idx=-1,
-        pass_configs=_PASS_CONFIGS,
-    )
+    prim = _mhc_head_compute_mix_fwd.get_tir(mhc_mult, mhc_pre_eps, token_block_size, threads)
+    return tilelang.compile(prim, target="ascend", pass_configs=_PASS_CONFIGS)
 
 
 def mhc_head_compute_mix_fwd(
@@ -85,29 +65,20 @@ def mhc_head_compute_mix_fwd(
     mhc_scale: torch.Tensor,
     mhc_base: torch.Tensor,
     mhc_pre_eps: float = 1e-6,
-    token_block_size: int = TOKEN_BLOCK_SIZE,
-    threads: int = THREADS,
+    token_block_size: int = 32,
+    threads: int = 128,
 ) -> torch.Tensor:
-    """Compile and invoke the Ascend kernel on a tensor shaped ``(..., M)``."""
-    assert input_mix.dtype == torch.float32
-    assert input_mix.ndim >= 2
-    assert input_mix.is_contiguous()
+    """Host wrapper mirroring tile_kernels/modeling/mhc/ops/head_compute_mix.py."""
+    assert input_mix.ndim == 3
+    shape = input_mix.shape
     mhc_mult = input_mix.shape[-1]
-    assert mhc_scale.shape == (1,)
-    assert mhc_scale.dtype == torch.float32
-    assert mhc_base.shape == (mhc_mult,)
-    assert mhc_base.dtype == torch.float32
 
-    flat_input = input_mix.reshape(-1, mhc_mult)
-    kernel = _compile_head_compute_mix_fwd(
-        flat_input.shape[0],
-        mhc_mult,
-        mhc_pre_eps,
-        token_block_size,
-        threads,
-    )
-    output = kernel(flat_input, mhc_scale, mhc_base)
-    return output.reshape_as(input_mix)
+    input_mix = input_mix.contiguous().view(-1, mhc_mult)
+    output_mix = torch.empty_like(input_mix)
+
+    fwd_kernel = _compile_mhc_head_compute_mix_fwd(mhc_mult, mhc_pre_eps, token_block_size, threads)
+    fwd_kernel(input_mix, mhc_scale, mhc_base, output_mix)
+    return output_mix.view(shape)
 
 
 def mhc_head_compute_mix_fwd_ref(
@@ -116,7 +87,7 @@ def mhc_head_compute_mix_fwd_ref(
     mhc_base: torch.Tensor,
     mhc_pre_eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Torch reference for the forward operator."""
+    """Torch reference with the same formula as the kernel."""
     return torch.sigmoid(input_mix * mhc_scale[0] + mhc_base) + mhc_pre_eps
 
 
