@@ -29,6 +29,29 @@ def _mhc_head_compute_mix_fwd(
 
     return main
 
+def gpu_mhc_head_compute_mix_fwd(
+    mhc_mult: int,
+    mhc_pre_eps: float,
+    token_block_size: int,
+) -> tilelang.JITKernel:
+    num_tokens = T.dynamic('num_tokens')
+
+    @T.prim_func
+    def gpu_mhc_head_compute_mix_fwd_kernel(
+        # Input
+        input_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+        mhc_scale: T.Tensor[(1,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult,), T.float32],
+        # Output
+        output_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+    ) -> None:
+        with T.Kernel(T.ceildiv(num_tokens, token_block_size)) as pid:
+            for i1, j in T.Parallel(token_block_size, mhc_mult):
+                i = pid * token_block_size + i1
+                if i < num_tokens:
+                    output_mix[i, j] = T.sigmoid(input_mix[i, j] * mhc_scale[0] + mhc_base[j]) + mhc_pre_eps
+
+    return gpu_mhc_head_compute_mix_fwd_kernel
 
 def ref_program(
     input_mix: torch.Tensor,
@@ -55,3 +78,11 @@ if __name__ == "__main__":
     torch.npu.synchronize()
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-5)
     print("PASS: mhc_head_compute_mix_fwd")
+
+    gpu_program = gpu_mhc_head_compute_mix_fwd(mhc_mult, mhc_pre_eps, token_block_size)
+    gpu_kernel = tilelang.compile(gpu_program, target="ascend", out_idx=-1)
+    # gpu_actual = gpu_kernel(input_mix, mhc_scale, mhc_base)
+    # gpu_expected = ref_program(input_mix, mhc_scale, mhc_base, mhc_pre_eps)
+    # torch.npu.synchronize()
+    # torch.testing.assert_close(gpu_actual, gpu_expected, rtol=1e-5, atol=2e-5)
+    # print("PASS: gpu_mhc_head_compute_mix_fwd")
