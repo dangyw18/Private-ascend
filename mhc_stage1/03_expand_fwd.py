@@ -76,13 +76,13 @@ if __name__ == "__main__":
     mhc_mult = 4
     # x = torch.randn((128, hidden), device="npu", dtype=torch.bfloat16)
 
-    program = expand_to_mhc_fwd_simtvf(hidden, mhc_mult)
-    kernel = tilelang.compile(program, target="ascend", out_idx=-1)
+    # program = expand_to_mhc_fwd_simtvf(hidden, mhc_mult)
+    # kernel = tilelang.compile(program, target="ascend", out_idx=-1)
     # actual = kernel(x)
     # expected = ref_program(x, mhc_mult)
     # torch.npu.synchronize()
     # torch.testing.assert_close(actual, expected)
     # print("PASS: expand_to_mhc_fwd")
 
-    # gpu_program = gpu_expand_to_mhc_fwd(hidden, mhc_mult)
-    # gpu_kernel = tilelang.compile(gpu_program, target="ascend", out_idx=-1)
+    gpu_program = gpu_expand_to_mhc_fwd(hidden, mhc_mult)
+    gpu_kernel = tilelang.compile(gpu_program, target="ascend", out_idx=-1)

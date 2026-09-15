@@ -74,20 +74,33 @@ def mhc_fn_normw_merge_bwd(m: int, n: int, dtype: T.dtype = T.float32, n_thr: in
 def ref_program(
     fn: torch.Tensor,
     normw: torch.Tensor,
-) -> torch.Tensor:
-    return fn * normw
+    out_fn_grad: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return out_fn_grad * normw, (out_fn_grad * fn).sum(dim=0)
 
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-    m, n = 24, 7168
-    # fn = torch.randn((m, n), device="npu", dtype=torch.float32)
-    # normw = torch.randn((n,), device="npu", dtype=torch.float32)
+    m, n = 128, 512
+    fn = torch.randn((m, n), device="npu", dtype=torch.float32)
+    normw = torch.randn((n,), device="npu", dtype=torch.float32)
+    out_fn_grad = torch.randn((m, n), device="npu", dtype=torch.float32)
 
-    program = gpu_mhc_fn_normw_merge_bwd(m, n)
-    kernel = tilelang.compile(program, target="ascend", out_idx=-1)
-    # actual = kernel(fn, normw)
-    # expected = ref_program(fn, normw)
+    program = mhc_fn_normw_merge_bwd(m, n)
+    kernel = tilelang.compile(program, target="ascend", out_idx=[-2, -1])
+    fn_grad, normw_grad = kernel(fn, normw, out_fn_grad)
+    torch.npu.synchronize()
+    expected_fn_grad, expected_normw_grad = ref_program(fn, normw, out_fn_grad)
+    torch.testing.assert_close(fn_grad, expected_fn_grad, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(normw_grad, expected_normw_grad, rtol=1e-5, atol=2e-5)
+    print("PASS: mhc_fn_normw_merge_bwd")
+
+    gpu_program = gpu_mhc_fn_normw_merge_bwd(m, n)
+    gpu_kernel = tilelang.compile(gpu_program, target="ascend", out_idx=[-2, -1])
+    # gpu_actual = gpu_kernel(fn, normw, out_fn_grad)
+    # gpu_expected = ref_program(fn, normw, out_fn_grad)
     # torch.npu.synchronize()
-    # torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-    # print("PASS: mhc_fn_normw_merge_bwd")
+    # torch.testing.assert_close(gpu_actual[0], gpu_expected[0], rtol=1e-5, atol=2e-5)
+    # torch.testing.assert_close(gpu_actual[1], gpu_expected[1], rtol=1e-5, atol=2e-5)
+    # print("PASS: gpu_mhc_fn_normw_merge_bwd")
+
